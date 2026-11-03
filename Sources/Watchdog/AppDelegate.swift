@@ -59,7 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             && (env["WATCHDOG_SESSION_PATH"] != nil || env["WATCHDOG_FAKE_PRESSURE"] != nil || env["WATCHDOG_FAKE_PRESSURE_FILE"] != nil)
         if !testMode {
             let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-            item.button?.image = Icon.dot(.green)
+            item.button?.image = Icon.chip(.green)
             item.button?.toolTip = "Watchdog: checking…"
             menu.delegate = self
             item.menu = menu
@@ -145,7 +145,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             announce(level: .red, reasons: v.texts, sample: sample)
         }
 
-        statusItem?.button?.image = Icon.dot(shown)
+        statusItem?.button?.image = Icon.chip(shown)
         statusItem?.button?.toolTip = "Watchdog: \(shown.title)" + (v.texts.isEmpty ? "" : " — " + v.texts.joined(separator: " "))
 
         for shell in pilot.reconcile(sessions: sample.sessions) where Sampler.isStoppedProcessOfMine(shell) {
@@ -666,6 +666,27 @@ enum Icon {
         case .orange: return .systemOrange
         case .red: return .systemRed
         }
+    }
+
+    /// The menu bar icon: a memory chip in the colour of the level. Falls back to the dot if the symbol is missing.
+    static func chip(_ level: Level) -> NSImage {
+        let size = NSSize(width: 20, height: 18)
+        guard let symbol = NSImage(systemSymbolName: "memorychip", accessibilityDescription: "Memory: \(level.title)")?
+                .withSymbolConfiguration(.init(pointSize: 15, weight: .medium)) else {
+            return dot(level)
+        }
+        let image = NSImage(size: size, flipped: false) { rect in
+            let s = symbol.size
+            let target = NSRect(x: (rect.width - s.width) / 2, y: (rect.height - s.height) / 2, width: s.width, height: s.height)
+            symbol.draw(in: target)
+            // Recolour whatever the symbol drew.
+            color(level).set()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+        image.isTemplate = false
+        image.accessibilityDescription = "Memory: \(level.title)"
+        return image
     }
 
     static func dot(_ level: Level) -> NSImage {

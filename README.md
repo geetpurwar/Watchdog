@@ -1,6 +1,6 @@
 # Watchdog
 
-Menu bar dot that tells you whether this Mac is about to freeze.
+Menu bar memory chip, green, orange or red, that tells you whether this Mac is about to freeze.
 
 - **Green**: memory, swap and disk have room.
 - **Orange**: warning. Kernel memory pressure warning, swapping out at 20 MB/s or more, swap above 4 GB, disk under 15 GB or under 5%, or memory used above 93%.
