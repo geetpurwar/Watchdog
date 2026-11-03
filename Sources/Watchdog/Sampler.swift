@@ -431,6 +431,15 @@ enum Sampler {
         return result
     }
 
+    /// True only for a live process of mine that is currently stopped. Never signal anything else blindly.
+    static func isStoppedProcessOfMine(_ pid: pid_t) -> Bool {
+        guard pid > 1 else { return false }
+        var bsd = proc_bsdinfo()
+        let wanted = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsd, wanted) == wanted else { return false }
+        return bsd.pbi_ruid == getuid() && bsd.pbi_status == UInt32(SSTOP)
+    }
+
     /// The parent shell of a process, if its parent is an interactive shell.
     static func parentShell(of pid: pid_t) -> pid_t? {
         var bsd = proc_bsdinfo()

@@ -145,12 +145,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         statusItem?.button?.image = Icon.dot(shown)
         statusItem?.button?.toolTip = "Watchdog: \(shown.title)" + (v.texts.isEmpty ? "" : " — " + v.texts.joined(separator: " "))
 
-        for s in pilot.adopt(sessions: sample.sessions) {
-            log.event("adopted paused session '\(s.label)' pid \(s.pid) (paused with its shell by an earlier Watchdog); will resume it when memory is calm")
-        }
-        for shell in pilot.reconcile(sessions: sample.sessions) {
+        for shell in pilot.reconcile(sessions: sample.sessions) where Sampler.isStoppedProcessOfMine(shell) {
             let rc = kill(shell, SIGCONT)
             log.event("freed shell \(shell): its paused session ended, \(rc == 0 ? "ok" : "failed errno=\(errno)")")
+        }
+        for s in pilot.adopt(sessions: sample.sessions) {
+            log.event("adopted paused session '\(s.label)' pid \(s.pid) (paused with its shell by an earlier Watchdog); will resume it when memory is calm")
         }
         // Belt and braces: any stopped shell of mine with nothing alive under it, seen twice, is continued.
         let stranded = Set(Sampler.stoppedShellsWithoutChildren(in: sample.topProcessesAll))
@@ -319,7 +319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             if !session.tty.isEmpty { title += "   \(session.tty)" }
             if session.startedAt > .distantPast { title += ", since \(clock.string(from: session.startedAt))" }
             if session.paused {
-                title += pilot.pausedByUs.contains(session.pid) ? "  — paused by Watchdog" : "  — paused"
+                title += pilot.pausedByUs.contains(session.pid) ? "  — paused by Watchdog" : "  — paused by you"
             }
             let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
             item.indentationLevel = 1
@@ -402,6 +402,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     @objc private func pauseSession(_ sender: Any?) {
         guard let s = session(from: sender) else { return }
         let o = SessionControl.pause(pid: s.pid, shell: s.shellPid)
+        pilot.markManual(s.pid, shell: s.shellPid)
         log.event("user paused session '\(s.label)' pid \(s.pid): \(o.description)")
         checkNow()
     }
