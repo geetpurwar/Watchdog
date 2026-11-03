@@ -12,6 +12,8 @@ struct ProcessRow: Codable {
     let parentPid: Int32
     let tty: String
     let startedAt: Date
+    /// Runs from the Claude Code binary. Its grep helper does too, so this alone does not make it a session.
+    let claudeBinary: Bool
 }
 
 /// One Claude Code session: the `claude` process plus everything it spawned.
@@ -22,6 +24,8 @@ struct SessionRow: Codable {
     let cwd: String
     /// The interactive shell that started it, if any. Frozen together with the session so it cannot grab the terminal.
     let shellPid: Int32?
+    /// The shell is stopped too: the signature of a pause done by Watchdog (a Ctrl-Z leaves the shell running).
+    let shellPaused: Bool
     let treeBytes: UInt64
     let treeCount: Int
     let paused: Bool
@@ -288,8 +292,12 @@ enum Sampler {
             var name = String(cString: nameBuffer)
 
             pathBuffer[0] = 0
+            var claudeBinary = false
             if proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count)) > 0, isClaudeExecutable(String(cString: pathBuffer)) {
-                name = "claude"
+                claudeBinary = true
+                // The kernel names the native install by its version ("2.1.312"); the same binary also runs
+                // as "ugrep" for the Grep tool. Only the real thing is relabelled.
+                if name == "claude" || looksLikeVersion(name) { name = "claude" }
             }
 
             var bsd = proc_bsdinfo()
@@ -313,20 +321,37 @@ enum Sampler {
                 paused: paused,
                 parentPid: parent,
                 tty: tty,
-                startedAt: started
+                startedAt: started,
+                claudeBinary: claudeBinary
             ))
         }
         return rows.sorted { $0.footprintBytes > $1.footprintBytes }
     }
 
-    /// Claude Code sessions with their process trees. A `claude -p` child of a session is part of that session, not a session.
+    static func looksLikeVersion(_ s: String) -> Bool {
+        let parts = s.split(separator: ".")
+        return parts.count == 3 && parts.allSatisfy { !$0.isEmpty && $0.allSatisfy(\.isNumber) }
+    }
+
+    /// Claude Code sessions with their process trees. Anything the session spawned, however deep (a shell, a
+    /// `claude -p`, its own grep helper), belongs to that session and is never a session of its own.
     static func sessions(in rows: [ProcessRow]) -> [SessionRow] {
         let byPid = Dictionary(uniqueKeysWithValues: rows.map { ($0.pid, $0) })
         var childrenOf: [Int32: [ProcessRow]] = [:]
         for r in rows { childrenOf[r.parentPid, default: []].append(r) }
 
         let claudePids = Set(rows.filter { $0.name == "claude" }.map(\.pid))
-        let roots = rows.filter { $0.name == "claude" && !claudePids.contains($0.parentPid) }
+        func hasClaudeAncestor(_ row: ProcessRow) -> Bool {
+            var p = row.parentPid
+            var hops = 0
+            while p > 1, hops < 64, let parent = byPid[p] {
+                if claudePids.contains(parent.pid) { return true }
+                p = parent.parentPid
+                hops += 1
+            }
+            return false
+        }
+        let roots = rows.filter { $0.name == "claude" && !hasClaudeAncestor($0) }
 
         return roots.map { root in
             var bytes = root.footprintBytes
@@ -342,13 +367,14 @@ enum Sampler {
             }
             let parent = byPid[root.parentPid]
             let shell = parent.flatMap { shells.contains($0.name) ? $0.pid : nil }
+            let shellPaused = shell != nil && (parent?.paused ?? false)
             let cwd = workingDirectory(of: root.pid) ?? ""
             let home = FileManager.default.homeDirectoryForCurrentUser.path
             let label: String
             if cwd.isEmpty { label = "claude \(root.pid)" }
             else if cwd == home { label = "~" }
             else { label = URL(fileURLWithPath: cwd).lastPathComponent }
-            return SessionRow(pid: root.pid, label: label, cwd: cwd, shellPid: shell,
+            return SessionRow(pid: root.pid, label: label, cwd: cwd, shellPid: shell, shellPaused: shellPaused,
                               treeBytes: bytes, treeCount: count, paused: root.paused,
                               tty: root.tty, startedAt: root.startedAt)
         }.sorted { $0.treeBytes > $1.treeBytes }

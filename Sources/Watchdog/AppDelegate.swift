@@ -2,7 +2,7 @@ import AppKit
 import UserNotifications
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
-    private var statusItem: NSStatusItem!
+    private var statusItem: NSStatusItem?
     private let menu = NSMenu()
     private var timer: DispatchSourceTimer?
     private var termSource: DispatchSourceSignal?
@@ -48,11 +48,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 exit(0)
             }
         }
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.image = Icon.dot(.green)
-        statusItem.button?.toolTip = "Watchdog: checking…"
-        menu.delegate = self
-        statusItem.menu = menu
+        // A raw test copy (fake pressure or a fake session path, no bundle) stays out of the menu bar.
+        let env = ProcessInfo.processInfo.environment
+        let testMode = Bundle.main.bundleIdentifier == nil
+            && (env["WATCHDOG_SESSION_PATH"] != nil || env["WATCHDOG_FAKE_PRESSURE"] != nil || env["WATCHDOG_FAKE_PRESSURE_FILE"] != nil)
+        if !testMode {
+            let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+            item.button?.image = Icon.dot(.green)
+            item.button?.toolTip = "Watchdog: checking…"
+            menu.delegate = self
+            item.menu = menu
+            statusItem = item
+        }
 
         // Keep App Nap from stretching the 10 s timer while we sit idle in the background.
         activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep],
@@ -70,7 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         termSource = term
 
         setUpNotifications()
-        log.event("started pid=\(getpid()) launchd=\(managedByLaunchd) bundle=\(Bundle.main.bundleIdentifier ?? "none") auto=\(pilot.enabled) log=\(log.directory.path)")
+        log.event("started pid=\(getpid()) launchd=\(managedByLaunchd) bundle=\(Bundle.main.bundleIdentifier ?? "none") auto=\(pilot.enabled) remembered paused=\(pilot.pausedByUs) menubar=\(statusItem != nil) log=\(log.directory.path)")
 
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now(), repeating: interval, leeway: .seconds(1))
@@ -133,9 +140,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             announce(level: .red, reasons: v.texts, sample: sample)
         }
 
-        statusItem.button?.image = Icon.dot(shown)
-        statusItem.button?.toolTip = "Watchdog: \(shown.title)" + (v.texts.isEmpty ? "" : " — " + v.texts.joined(separator: " "))
+        statusItem?.button?.image = Icon.dot(shown)
+        statusItem?.button?.toolTip = "Watchdog: \(shown.title)" + (v.texts.isEmpty ? "" : " — " + v.texts.joined(separator: " "))
 
+        for s in pilot.adopt(sessions: sample.sessions) {
+            log.event("adopted paused session '\(s.label)' pid \(s.pid) (paused with its shell by an earlier Watchdog); will resume it when memory is calm")
+        }
         if let decision = pilot.decide(sample: sample, verdict: v, shown: shown, now: now) {
             perform(decision, now: now)
         }

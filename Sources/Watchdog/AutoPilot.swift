@@ -11,14 +11,25 @@ final class AutoPilot {
 
     static let defaultsKey = "autoMode"
     static let memoryRedKeys: Set<String> = ["pressure", "swapout", "swapgrowth", "swap", "used"]
-    /// Reasons that mean memory is still busy. The static swap level is left out: swap lingers for hours after a crunch.
-    static let memoryBusyKeys: Set<String> = ["pressure", "swapout", "swapgrowth", "used"]
+    static let pausedKey = "autoPaused"
+
+    /// Memory is still busy while a memory reason is red, or the Mac is actively swapping or growing swap.
+    /// A kernel "warning" alone is not busy: on a 16 GB Mac it can last for hours, and sessions must not stay
+    /// frozen that long. If resuming tips it back to red, the pause logic simply runs again.
+    static func memoryBusy(_ reasons: [Reason]) -> Bool {
+        reasons.contains { r in
+            (memoryRedKeys.contains(r.key) && r.level == .red) || r.key == "swapout" || r.key == "swapgrowth"
+        }
+    }
 
     let redSamplesBeforePause = 2
     let calmSamplesBeforeResume = 6
     let actionSpacing: TimeInterval = 30
 
-    private(set) var pausedByUs: [Int32] = []
+    /// Sessions we paused, in pause order. Saved, so a restart still knows to resume them.
+    private(set) var pausedByUs: [Int32] = [] {
+        didSet { UserDefaults.standard.set(pausedByUs.map(Int.init), forKey: Self.pausedKey) }
+    }
     private var redStreak = 0
     private var calmStreak = 0
     private var lastAction = Date.distantPast
@@ -28,9 +39,23 @@ final class AutoPilot {
         set { UserDefaults.standard.set(newValue, forKey: Self.defaultsKey) }
     }
 
+    init() {
+        if let saved = UserDefaults.standard.array(forKey: Self.pausedKey) as? [Int] {
+            pausedByUs = saved.map(Int32.init)
+        }
+    }
+
     /// Forget sessions that ended or that the user resumed by hand.
     func reconcile(sessions: [SessionRow]) {
         pausedByUs = pausedByUs.filter { pid in sessions.contains { $0.pid == pid && $0.paused } }
+    }
+
+    /// A session stopped together with its shell was paused by Watchdog (nothing else stops the shell).
+    /// Take it over, so a restarted Watchdog still resumes what an earlier one paused.
+    func adopt(sessions: [SessionRow]) -> [SessionRow] {
+        let stranded = sessions.filter { $0.paused && $0.shellPaused && !pausedByUs.contains($0.pid) }
+        for s in stranded { pausedByUs.append(s.pid) }
+        return stranded
     }
 
     func decide(sample: Sample, verdict: Verdict, shown: Level, now: Date) -> Decision? {
@@ -42,7 +67,7 @@ final class AutoPilot {
         }
 
         let memoryRed = shown == .red && verdict.reasons.contains { $0.level == .red && Self.memoryRedKeys.contains($0.key) }
-        let memoryBusy = verdict.reasons.contains { Self.memoryBusyKeys.contains($0.key) }
+        let memoryBusy = Self.memoryBusy(verdict.reasons)
 
         if memoryRed {
             redStreak += 1
