@@ -31,6 +31,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var previousKeys = Set<String>()
     private var lastAnnouncedAt: [String: Date] = [:]
     private let sameKeyCooldown: TimeInterval = 10 * 60
+    /// Stopped, childless shells seen in the previous reading; rescued when seen twice in a row.
+    private var strandedShellCandidates = Set<Int32>()
     private var clearDevSpace: URL? {
         let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop/Clear-Dev-Space.command")
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
@@ -146,6 +148,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         for s in pilot.adopt(sessions: sample.sessions) {
             log.event("adopted paused session '\(s.label)' pid \(s.pid) (paused with its shell by an earlier Watchdog); will resume it when memory is calm")
         }
+        for shell in pilot.reconcile(sessions: sample.sessions) {
+            let rc = kill(shell, SIGCONT)
+            log.event("freed shell \(shell): its paused session ended, \(rc == 0 ? "ok" : "failed errno=\(errno)")")
+        }
+        // Belt and braces: any stopped shell of mine with nothing alive under it, seen twice, is continued.
+        let stranded = Set(Sampler.stoppedShellsWithoutChildren(in: sample.topProcessesAll))
+        for shell in stranded.intersection(strandedShellCandidates) {
+            let rc = kill(shell, SIGCONT)
+            log.event("rescued stopped shell \(shell) with no live children: \(rc == 0 ? "ok" : "failed errno=\(errno)")")
+        }
+        strandedShellCandidates = stranded
         if let decision = pilot.decide(sample: sample, verdict: v, shown: shown, now: now) {
             perform(decision, now: now)
         }
@@ -161,7 +174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         switch decision {
         case .pause(let s):
             let o = SessionControl.pause(pid: s.pid, shell: s.shellPid)
-            pilot.didPause(s.pid, at: now)
+            pilot.didPause(s.pid, shell: s.shellPid, at: now)
             log.event("auto paused session '\(s.label)' pid \(s.pid) (\(Format.gb(s.treeBytes)) in \(s.treeCount) processes, shell \(s.shellPid.map(String.init) ?? "none")): \(o.description)")
             notify(title: "Watchdog paused a Claude session",
                    body: "The session in \(s.label) (\(Format.gb(s.treeBytes)) with its tools) is paused to protect the Mac. It resumes by itself once memory calms down.",

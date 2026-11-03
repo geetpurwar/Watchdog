@@ -12,6 +12,7 @@ final class AutoPilot {
     static let defaultsKey = "autoMode"
     static let memoryRedKeys: Set<String> = ["pressure", "swapout", "swapgrowth", "swap", "used"]
     static let pausedKey = "autoPaused"
+    static let shellsKey = "autoPausedShells"
 
     /// Memory is still busy while a memory reason is red, or the Mac is actively swapping or growing swap.
     /// A kernel "warning" alone is not busy: on a 16 GB Mac it can last for hours, and sessions must not stay
@@ -30,6 +31,14 @@ final class AutoPilot {
     private(set) var pausedByUs: [Int32] = [] {
         didSet { UserDefaults.standard.set(pausedByUs.map(Int.init), forKey: Self.pausedKey) }
     }
+    /// The shell frozen alongside each paused session, so it can be freed even if the session dies while paused.
+    private(set) var shellOf: [Int32: Int32] = [:] {
+        didSet {
+            var saved: [String: Int] = [:]
+            for (pid, shell) in shellOf { saved[String(pid)] = Int(shell) }
+            UserDefaults.standard.set(saved, forKey: Self.shellsKey)
+        }
+    }
     private var redStreak = 0
     private var calmStreak = 0
     private var lastAction = Date.distantPast
@@ -43,23 +52,36 @@ final class AutoPilot {
         if let saved = UserDefaults.standard.array(forKey: Self.pausedKey) as? [Int] {
             pausedByUs = saved.map(Int32.init)
         }
+        if let saved = UserDefaults.standard.dictionary(forKey: Self.shellsKey) as? [String: Int] {
+            for (pid, shell) in saved { if let p = Int32(pid) { shellOf[p] = Int32(shell) } }
+        }
     }
 
-    /// Forget sessions that ended or that the user resumed by hand.
-    func reconcile(sessions: [SessionRow]) {
-        pausedByUs = pausedByUs.filter { pid in sessions.contains { $0.pid == pid && $0.paused } }
+    /// Forget sessions that ended or that the user resumed by hand. Returns the shells of sessions that are
+    /// gone altogether: they are still frozen and nobody else will ever free them.
+    func reconcile(sessions: [SessionRow]) -> [Int32] {
+        var orphanedShells: [Int32] = []
+        pausedByUs = pausedByUs.filter { pid in
+            if sessions.contains(where: { $0.pid == pid && $0.paused }) { return true }
+            if !sessions.contains(where: { $0.pid == pid }), let shell = shellOf[pid] { orphanedShells.append(shell) }
+            shellOf[pid] = nil
+            return false
+        }
+        return orphanedShells
     }
 
     /// A session stopped together with its shell was paused by Watchdog (nothing else stops the shell).
     /// Take it over, so a restarted Watchdog still resumes what an earlier one paused.
     func adopt(sessions: [SessionRow]) -> [SessionRow] {
         let stranded = sessions.filter { $0.paused && $0.shellPaused && !pausedByUs.contains($0.pid) }
-        for s in stranded { pausedByUs.append(s.pid) }
+        for s in stranded {
+            pausedByUs.append(s.pid)
+            shellOf[s.pid] = s.shellPid
+        }
         return stranded
     }
 
     func decide(sample: Sample, verdict: Verdict, shown: Level, now: Date) -> Decision? {
-        reconcile(sessions: sample.sessions)
         guard enabled else {
             redStreak = 0
             calmStreak = 0
@@ -91,17 +113,20 @@ final class AutoPilot {
         return .resume(session)
     }
 
-    func didPause(_ pid: Int32, at now: Date) {
+    func didPause(_ pid: Int32, shell: Int32?, at now: Date) {
         pausedByUs.append(pid)
+        shellOf[pid] = shell
         lastAction = now
     }
 
     func didResume(_ pid: Int32, at now: Date) {
         pausedByUs.removeAll { $0 == pid }
+        shellOf[pid] = nil
         lastAction = now
     }
 
     func forget(_ pid: Int32) {
         pausedByUs.removeAll { $0 == pid }
+        shellOf[pid] = nil
     }
 }

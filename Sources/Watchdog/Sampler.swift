@@ -60,6 +60,14 @@ struct Sample: Codable {
     let cpuCount: Int
     let sessions: [SessionRow]
     let topProcesses: [ProcessRow]
+    /// Every measured process; used for the stranded-shell sweep. Not written to the status JSON.
+    var topProcessesAll: [ProcessRow] = []
+
+    enum CodingKeys: String, CodingKey {
+        case date, pressureLevel, totalBytes, usedBytes, compressedBytes, freeBytes, swapUsedBytes, swapOutBytesPerSec,
+             swapGrowth2mBytes, diskFreeBytes, diskFreeImportantBytes, diskTotalBytes, diskWriteBytesPerSec,
+             diskWriteLatencyMs, load1, load5, cpuCount, sessions, topProcesses
+    }
 
     var claudeCount: Int { sessions.count }
     var claudeBytes: UInt64 { sessions.reduce(0) { $0 + $1.treeBytes } }
@@ -140,7 +148,7 @@ enum Sampler {
         let procs = processes()
         let sessions = sessions(in: procs)
 
-        return Sample(
+        var sample = Sample(
             date: now,
             pressureLevel: pressure,
             totalBytes: total,
@@ -161,6 +169,8 @@ enum Sampler {
             sessions: sessions,
             topProcesses: Array(procs.prefix(topLimit))
         )
+        sample.topProcessesAll = procs
+        return sample
     }
 
     /// Test hook: WATCHDOG_FAKE_PRESSURE=<n>, or WATCHDOG_FAKE_PRESSURE_FILE=<path> read every time.
@@ -378,6 +388,16 @@ enum Sampler {
                               treeBytes: bytes, treeCount: count, paused: root.paused,
                               tty: root.tty, startedAt: root.startedAt)
         }.sorted { $0.treeBytes > $1.treeBytes }
+    }
+
+    /// Interactive shells of mine that are stopped although nothing of theirs is still alive. A shell paused
+    /// alongside a session still has that (stopped) child; one whose session died while paused does not, and
+    /// its terminal is frozen for good unless someone continues it.
+    static func stoppedShellsWithoutChildren(in rows: [ProcessRow]) -> [Int32] {
+        var hasChild = Set<Int32>()
+        for r in rows { hasChild.insert(r.parentPid) }
+        return rows.filter { shells.contains($0.name) && $0.paused && $0.ownedByMe && !$0.tty.isEmpty && !hasChild.contains($0.pid) }
+                   .map(\.pid)
     }
 
     static func workingDirectory(of pid: pid_t) -> String? {
