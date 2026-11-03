@@ -13,6 +13,27 @@ if arguments.contains("--status") {
     exit(0)
 }
 
+if arguments.contains("--saved") || arguments.contains("--resume-saved") {
+    let log = EventLog()
+    let store = SavedSessionStore(directory: SavedSessionStore.defaultDirectory(logDirectory: log.directory))
+    if let i = arguments.firstIndex(of: "--resume-saved"), i + 1 < arguments.endIndex, let s = store.sessions.first(where: { $0.sessionId == arguments[i + 1] }) {
+        switch store.launch(s) {
+        case .success(let how):
+            store.remove(sessionId: s.sessionId)
+            print(how)
+        case .failure(let error):
+            print("failed: \(error.localizedDescription)")
+            exit(1)
+        }
+        exit(0)
+    }
+    for s in store.sessions {
+        print("\(s.sessionId)  \(s.name)  \(Format.gb(s.treeBytes))  quit \(s.quitAt)  (\(s.reason))  cd \(SavedSessionStore.shellQuote(s.cwd)) && \(s.resumeCommand)")
+    }
+    if store.sessions.isEmpty { print("no saved sessions in \(store.fileURL.path)") }
+    exit(0)
+}
+
 if arguments.contains("--enable-login") {
     print(LoginItem.enable())
     exit(0)

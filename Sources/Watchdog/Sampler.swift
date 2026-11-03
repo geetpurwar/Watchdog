@@ -32,6 +32,21 @@ struct SessionRow: Codable {
     /// Terminal it runs in, e.g. "ttys009", or "" when it has none.
     let tty: String
     let startedAt: Date
+    /// From Claude Code's own ~/.claude/sessions/<pid>.json, when present.
+    let sessionId: String?
+    /// Claude Code's name for it (e.g. "hyperbond-b9"), else the folder label.
+    let name: String
+    /// "busy", "idle" or "" when unknown.
+    let status: String
+}
+
+/// What Claude Code records about a running session.
+struct ClaudeSessionInfo {
+    let sessionId: String
+    let name: String
+    let cwd: String
+    let status: String
+    let kind: String
 }
 
 /// One reading of the machine. Everything the rules and the menu need.
@@ -379,7 +394,8 @@ enum Sampler {
             let parent = byPid[root.parentPid]
             let shell = parent.flatMap { shells.contains($0.name) ? $0.pid : nil }
             let shellPaused = shell != nil && (parent?.paused ?? false)
-            let cwd = workingDirectory(of: root.pid) ?? ""
+            let info = claudeSessionInfo(pid: root.pid)
+            let cwd = info?.cwd ?? workingDirectory(of: root.pid) ?? ""
             let home = FileManager.default.homeDirectoryForCurrentUser.path
             let label: String
             if cwd.isEmpty { label = "claude \(root.pid)" }
@@ -387,7 +403,8 @@ enum Sampler {
             else { label = URL(fileURLWithPath: cwd).lastPathComponent }
             return SessionRow(pid: root.pid, label: label, cwd: cwd, shellPid: shell, shellPaused: shellPaused,
                               treeBytes: bytes, treeCount: count, paused: root.paused,
-                              tty: root.tty, startedAt: root.startedAt)
+                              tty: root.tty, startedAt: root.startedAt,
+                              sessionId: info?.sessionId, name: info?.name ?? label, status: info?.status ?? "")
         }.sorted { $0.treeBytes > $1.treeBytes }
     }
 
@@ -399,6 +416,46 @@ enum Sampler {
         for r in rows { hasChild.insert(r.parentPid) }
         return rows.filter { shells.contains($0.name) && $0.paused && $0.ownedByMe && !$0.tty.isEmpty && !hasChild.contains($0.pid) }
                    .map(\.pid)
+    }
+
+    /// Claude Code writes ~/.claude/sessions/<pid>.json for each running session. WATCHDOG_SESSIONS_DIR overrides (tests).
+    static var sessionsDirectory: URL {
+        if let custom = env["WATCHDOG_SESSIONS_DIR"], !custom.isEmpty { return URL(fileURLWithPath: custom) }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/sessions")
+    }
+
+    static func claudeSessionInfo(pid: pid_t) -> ClaudeSessionInfo? {
+        let url = sessionsDirectory.appendingPathComponent("\(pid).json")
+        guard let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = obj["sessionId"] as? String, !id.isEmpty else { return nil }
+        return ClaudeSessionInfo(sessionId: id,
+                                 name: (obj["name"] as? String) ?? "",
+                                 cwd: (obj["cwd"] as? String) ?? "",
+                                 status: (obj["status"] as? String) ?? "",
+                                 kind: (obj["kind"] as? String) ?? "")
+    }
+
+    /// The command line of a process (argv), via KERN_PROCARGS2.
+    static func arguments(of pid: pid_t) -> [String] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return [] }
+        var buffer = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0, size > 4 else { return [] }
+        let argc = Int(buffer.withUnsafeBytes { $0.load(as: Int32.self) })
+        var i = 4
+        // Skip the executable path and the padding after it.
+        while i < size, buffer[i] != 0 { i += 1 }
+        while i < size, buffer[i] == 0 { i += 1 }
+        var args: [String] = []
+        while i < size, args.count < argc {
+            let start = i
+            while i < size, buffer[i] != 0 { i += 1 }
+            args.append(String(decoding: buffer[start..<i], as: UTF8.self))
+            i += 1
+        }
+        return args
     }
 
     static func workingDirectory(of pid: pid_t) -> String? {
@@ -473,6 +530,25 @@ enum SessionControl {
 
     static func quit(pid: pid_t) -> Outcome {
         signal([pid] + Sampler.descendants(of: pid), SIGTERM)
+    }
+
+    /// Anything of the tree still alive gets SIGKILL. Called a few seconds after `quit`.
+    static func forceQuit(pid: pid_t) -> Outcome {
+        let alive = ([pid] + Sampler.descendants(of: pid)).filter { kill($0, 0) == 0 }
+        return signal(alive, SIGKILL)
+    }
+
+    /// Everything needed to reopen the session later. Nil when Claude Code has no record of it (not interactive,
+    /// or not a real Claude Code session): such a session cannot be saved and should be paused instead.
+    static func savedRecord(for s: SessionRow, reason: String) -> SavedSession? {
+        guard let id = s.sessionId, !s.cwd.isEmpty else { return nil }
+        var args = Array(Sampler.arguments(of: s.pid).dropFirst())
+        if let i = args.firstIndex(of: "--resume") {
+            args.remove(at: i)
+            if i < args.count, !args[i].hasPrefix("-") { args.remove(at: i) }
+        }
+        return SavedSession(sessionId: id, name: s.name, cwd: s.cwd, args: args, treeBytes: s.treeBytes,
+                            status: s.status, quitAt: Date(), reason: reason)
     }
 
     private static func signal(_ pids: [pid_t], _ sig: Int32) -> Outcome {

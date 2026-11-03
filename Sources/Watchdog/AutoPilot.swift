@@ -10,6 +10,17 @@ final class AutoPilot {
     }
 
     static let defaultsKey = "autoMode"
+    static let actionKey = "redAction"
+
+    enum RedAction: String {
+        case quit     // quit the session and save how to reopen it (frees its memory)
+        case pause    // freeze it in place (keeps its memory)
+    }
+
+    var redAction: RedAction {
+        get { RedAction(rawValue: UserDefaults.standard.string(forKey: Self.actionKey) ?? "") ?? .quit }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: Self.actionKey) }
+    }
     /// What may trigger a pause. The static swap level is left out: paused sessions never give their swap
     /// back, so a lingering 8 GB would keep them paused for good.
     static let memoryRedKeys: Set<String> = ["pressure", "swapout", "swapgrowth", "used"]
@@ -153,7 +164,10 @@ final class AutoPilot {
             redStreak += 1
             calmStreak = 0
             guard redStreak >= redSamplesBeforePause, now.timeIntervalSince(lastAction) >= actionSpacing else { return nil }
-            if let target = sample.sessions.filter({ !$0.paused }).max(by: { $0.treeBytes < $1.treeBytes }) {
+            // Idle sessions first (nothing in flight to lose), heaviest first within each group.
+            let candidates = sample.sessions.filter { !$0.paused }
+            let idle = candidates.filter { $0.status == "idle" }
+            if let target = (idle.isEmpty ? candidates : idle).max(by: { $0.treeBytes < $1.treeBytes }) {
                 return .pause(target)
             }
             return nil
@@ -169,6 +183,11 @@ final class AutoPilot {
         guard !pausedByUs.isEmpty, calmStreak >= calmSamplesBeforeResume, now.timeIntervalSince(lastAction) >= actionSpacing,
               let pid = pausedByUs.last, let session = sample.sessions.first(where: { $0.pid == pid }) else { return nil }
         return .resume(session)
+    }
+
+    /// A quit-and-save counts as an action for spacing, but there is nothing to auto-resume afterwards.
+    func didAct(at now: Date) {
+        lastAction = now
     }
 
     func didPause(_ pid: Int32, shell: Int32?, at now: Date) {

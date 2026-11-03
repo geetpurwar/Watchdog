@@ -12,6 +12,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private let log = EventLog()
     private let thresholds = Thresholds.load()
     private let pilot = AutoPilot()
+    private lazy var store = SavedSessionStore(directory: SavedSessionStore.defaultDirectory(logDirectory: log.directory))
+    /// Told the user once per calm spell that saved sessions can come back.
+    private var savedCalmNotified = false
     /// Decided once at launch. Asking launchctl later would block the menu under memory pressure.
     private let managedByLaunchd = LoginItem.detectManaged()
 
@@ -165,6 +168,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         if let decision = pilot.decide(sample: sample, verdict: v, shown: shown, now: now) {
             perform(decision, now: now)
         }
+        if shown == .red { savedCalmNotified = false }
+        if !store.sessions.isEmpty, shown != .red, !AutoPilot.memoryBusy(v.reasons), !savedCalmNotified {
+            savedCalmNotified = true
+            let n = store.sessions.count
+            notify(title: "Memory has room again",
+                   body: "\(n) saved session\(n == 1 ? "" : "s") can be resumed from the Watchdog menu.", sound: false, id: "watchdog-saved")
+        }
     }
 
     private func topSummary(_ s: Sample) -> String {
@@ -175,6 +185,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     private func perform(_ decision: AutoPilot.Decision, now: Date) {
         switch decision {
+        case .pause(let s) where pilot.redAction == .quit:
+            if !quitAndSave(s, reason: "auto", now: now) {
+                // No Claude Code record to reopen it from: freeze it instead of losing it.
+                let o = SessionControl.pause(pid: s.pid, shell: s.shellPid)
+                pilot.didPause(s.pid, shell: s.shellPid, at: now)
+                log.event("auto paused session '\(s.name)' pid \(s.pid) instead of quitting (no session record): \(o.description)")
+                notify(title: "Watchdog paused a Claude session",
+                       body: "\(s.name) (\(Format.gb(s.treeBytes))) has no saved session record, so it was paused, not quit.",
+                       sound: true, id: "watchdog-auto")
+            }
         case .pause(let s):
             let o = SessionControl.pause(pid: s.pid, shell: s.shellPid)
             pilot.didPause(s.pid, shell: s.shellPid, at: now)
@@ -191,6 +211,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                    sound: false, id: "watchdog-auto")
         }
         checkNow()
+    }
+
+    /// Save how to reopen the session, then end it. Returns false when it cannot be saved.
+    @discardableResult
+    private func quitAndSave(_ s: SessionRow, reason: String, now: Date) -> Bool {
+        guard let record = SessionControl.savedRecord(for: s, reason: reason) else {
+            log.event("cannot save session '\(s.name)' pid \(s.pid): no ~/.claude/sessions record")
+            return false
+        }
+        store.add(record)
+        if s.paused { _ = SessionControl.resume(pid: s.pid, shell: s.shellPid) }   // a stopped process cannot handle SIGTERM
+        let o = SessionControl.quit(pid: s.pid)
+        pilot.forget(s.pid)
+        pilot.didAct(at: now)
+        savedCalmNotified = false
+        log.event("\(reason) quit and saved session '\(s.name)' id \(record.sessionId) pid \(s.pid) (\(Format.gb(s.treeBytes)) in \(s.treeCount) processes, \(s.status.isEmpty ? "status unknown" : s.status)): \(o.description); resume: \(record.resumeCommand)")
+        notify(title: reason == "auto" ? "Watchdog quit a Claude session and saved it" : "Session saved and quit",
+               body: "\(s.name) (\(Format.gb(s.treeBytes)) with its tools) was ended to free memory. Resume it from the Watchdog menu when there is room.",
+               sound: reason == "auto", id: "watchdog-auto")
+        let pid = s.pid
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            let f = SessionControl.forceQuit(pid: pid)
+            if f.ok > 0 { self?.log.event("force-killed \(f.ok) process(es) of session pid \(pid) that ignored SIGTERM") }
+            self?.checkNow()
+        }
+        checkNow()
+        return true
+    }
+
+    private func resumeSaved(_ s: SavedSession) {
+        switch store.launch(s) {
+        case .success(let how):
+            store.remove(sessionId: s.sessionId)
+            log.event("resumed saved session '\(s.name)' id \(s.sessionId): \(how)")
+        case .failure(let error):
+            log.event("could not resume saved session '\(s.name)' id \(s.sessionId): \(error.localizedDescription); command: cd \(SavedSessionStore.shellQuote(s.cwd)) && \(s.resumeCommand)")
+            notify(title: "Could not reopen \(s.name)",
+                   body: "Run this yourself: cd \(s.cwd) && \(s.resumeCommand)", sound: false, id: "watchdog-resume")
+        }
     }
 
     // MARK: - Notifications
@@ -318,7 +377,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let clock = DateFormatter()
         clock.dateFormat = "HH:mm"
         for session in s.sessions {
-            var title = "\(Format.gb(session.treeBytes))   \(session.label)"
+            var title = "\(Format.gb(session.treeBytes))   \(session.name)"
+            if !session.status.isEmpty { title += " (\(session.status))" }
             if !session.tty.isEmpty { title += "   \(session.tty)" }
             if session.startedAt > .distantPast { title += ", since \(clock.string(from: session.startedAt))" }
             if session.paused {
@@ -326,24 +386,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             }
             let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
             item.indentationLevel = 1
-            item.toolTip = "\(session.cwd)\npid \(session.pid), \(session.treeCount) processes"
+            item.toolTip = "\(session.cwd)\npid \(session.pid), \(session.treeCount) processes" + (session.sessionId.map { "\nsession \($0)" } ?? "")
             let sub = NSMenu()
+            if session.sessionId != nil {
+                sub.addItem(action("Quit and save (resume later from this menu, frees its memory)", #selector(quitAndSaveSession(_:)), session.pid))
+            }
             if session.paused {
                 sub.addItem(action("Resume", #selector(resumeSession(_:)), session.pid))
             } else {
                 sub.addItem(action("Pause (keeps its memory, stops its work)", #selector(pauseSession(_:)), session.pid))
             }
-            sub.addItem(action("Quit (frees its memory)", #selector(quitSession(_:)), session.pid))
+            sub.addItem(action("Quit without saving", #selector(quitSession(_:)), session.pid))
             item.submenu = sub
             menu.addItem(item)
         }
-        let auto = action("Auto mode: pause sessions when red, resume when calm", #selector(toggleAuto))
+        let auto = action("Auto mode: act when red, resume when calm", #selector(toggleAuto))
         auto.state = pilot.enabled ? .on : .off
         menu.addItem(auto)
+        let quitChoice = action("When red: quit sessions and save them (frees memory)", #selector(chooseQuit))
+        quitChoice.state = pilot.redAction == .quit ? .on : .off
+        quitChoice.indentationLevel = 1
+        menu.addItem(quitChoice)
+        let pauseChoice = action("When red: pause sessions (keeps memory)", #selector(choosePause))
+        pauseChoice.state = pilot.redAction == .pause ? .on : .off
+        pauseChoice.indentationLevel = 1
+        menu.addItem(pauseChoice)
         if !pilot.pausedByUs.isEmpty {
             menu.addItem(action("Resume every session Watchdog paused", #selector(resumeAllAuto)))
         }
         menu.addItem(.separator())
+
+        if !store.sessions.isEmpty {
+            menu.addItem(info("Saved sessions (quit, ready to resume)"))
+            for saved in store.sessions.sorted(by: { $0.quitAt > $1.quitAt }) {
+                let title = "\(saved.name)   \(Format.gb(saved.treeBytes)), quit \(clock.string(from: saved.quitAt)) (\(saved.reason))"
+                let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                item.indentationLevel = 1
+                item.toolTip = "\(saved.cwd)\n\(saved.resumeCommand)"
+                let sub = NSMenu()
+                sub.addItem(action("Resume in a new terminal tab", #selector(resumeSavedSession(_:)), saved))
+                sub.addItem(action("Copy resume command", #selector(copyResumeCommand(_:)), saved))
+                sub.addItem(action("Forget", #selector(forgetSavedSession(_:)), saved))
+                item.submenu = sub
+                menu.addItem(item)
+            }
+            if store.sessions.count > 1 {
+                menu.addItem(action("Resume all saved sessions, one by one", #selector(resumeAllSaved)))
+            }
+            menu.addItem(.separator())
+        }
 
         menu.addItem(info("Biggest processes (yours; system ones cannot be measured)"))
         for p in s.topProcesses.prefix(6) {
@@ -391,6 +482,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         return item
     }
 
+    private func action(_ title: String, _ selector: Selector, _ saved: SavedSession) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+        item.target = self
+        item.representedObject = saved.sessionId as NSString
+        return item
+    }
+
+    private func saved(from sender: Any?) -> SavedSession? {
+        guard let id = (sender as? NSMenuItem)?.representedObject as? String else { return nil }
+        return store.sessions.first { $0.sessionId == id }
+    }
+
     private func pid(from sender: Any?) -> Int32? {
         ((sender as? NSMenuItem)?.representedObject as? NSNumber)?.int32Value
     }
@@ -425,6 +528,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         pilot.forget(s.pid)
         log.event("user quit session '\(s.label)' pid \(s.pid): \(o.description)")
         checkNow()
+    }
+
+    @objc private func quitAndSaveSession(_ sender: Any?) {
+        guard let s = session(from: sender) else { return }
+        if !quitAndSave(s, reason: "user", now: Date()) {
+            notify(title: "Cannot save \(s.name)", body: "Claude Code has no record of this session, so it cannot be reopened later. Use Pause or Quit without saving.", sound: false, id: "watchdog-resume")
+        }
+    }
+
+    @objc private func resumeSavedSession(_ sender: Any?) {
+        guard let s = saved(from: sender) else { return }
+        resumeSaved(s)
+    }
+
+    @objc private func resumeAllSaved() {
+        let all = store.sessions.sorted { $0.quitAt < $1.quitAt }
+        for (i, s) in all.enumerated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 3) { [weak self] in self?.resumeSaved(s) }
+        }
+    }
+
+    @objc private func copyResumeCommand(_ sender: Any?) {
+        guard let s = saved(from: sender) else { return }
+        let text = "cd \(SavedSessionStore.shellQuote(s.cwd)) && \(s.resumeCommand)"
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        log.event("user copied the resume command for '\(s.name)'")
+    }
+
+    @objc private func forgetSavedSession(_ sender: Any?) {
+        guard let s = saved(from: sender) else { return }
+        store.remove(sessionId: s.sessionId)
+        log.event("user forgot saved session '\(s.name)' id \(s.sessionId)")
+    }
+
+    @objc private func chooseQuit() {
+        pilot.redAction = .quit
+        log.event("user chose: when red, quit sessions and save them")
+    }
+
+    @objc private func choosePause() {
+        pilot.redAction = .pause
+        log.event("user chose: when red, pause sessions")
     }
 
     @objc private func resumeAllAuto() {
