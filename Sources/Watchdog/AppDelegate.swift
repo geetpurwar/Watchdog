@@ -289,8 +289,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
         // Sessions
         menu.addItem(info("Claude Code sessions: \(s.claudeCount) using \(Format.gb(s.claudeBytes)) with their tools"))
+        let clock = DateFormatter()
+        clock.dateFormat = "HH:mm"
         for session in s.sessions {
             var title = "\(Format.gb(session.treeBytes))   \(session.label)"
+            if !session.tty.isEmpty { title += "   \(session.tty)" }
+            if session.startedAt > .distantPast { title += ", since \(clock.string(from: session.startedAt))" }
             if session.paused {
                 title += pilot.pausedByUs.contains(session.pid) ? "  — paused by Watchdog" : "  — paused"
             }

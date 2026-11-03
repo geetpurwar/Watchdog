@@ -10,6 +10,8 @@ struct ProcessRow: Codable {
     let ownedByMe: Bool
     let paused: Bool
     let parentPid: Int32
+    let tty: String
+    let startedAt: Date
 }
 
 /// One Claude Code session: the `claude` process plus everything it spawned.
@@ -23,6 +25,9 @@ struct SessionRow: Codable {
     let treeBytes: UInt64
     let treeCount: Int
     let paused: Bool
+    /// Terminal it runs in, e.g. "ttys009", or "" when it has none.
+    let tty: String
+    let startedAt: Date
 }
 
 /// One reading of the machine. Everything the rules and the menu need.
@@ -245,7 +250,11 @@ enum Sampler {
         if let prefix = env["WATCHDOG_SESSION_PATH"], !prefix.isEmpty {
             return path.hasPrefix(prefix)
         }
-        return path.contains("/share/claude/versions/") || path.hasSuffix("/claude")
+        // The native install, an npm install, or a `claude` on a bin path. A stray binary merely named
+        // "claude" somewhere else (a test fixture, a scratch folder) does not count.
+        return path.contains("/claude/versions/")
+            || path.contains("@anthropic-ai/claude-code")
+            || path.hasSuffix("/bin/claude")
     }
 
     /// Every process we can measure, biggest footprint first.
@@ -290,6 +299,11 @@ enum Sampler {
             let owned = haveInfo && bsd.pbi_ruid == me
             let paused = haveInfo && bsd.pbi_status == UInt32(SSTOP)
             let parent = haveInfo ? Int32(bsd.pbi_ppid) : 0
+            var tty = ""
+            if haveInfo, bsd.e_tdev != UInt32.max, let dev = devname(dev_t(bsd.e_tdev), S_IFCHR) {
+                tty = String(cString: dev)
+            }
+            let started = haveInfo ? Date(timeIntervalSince1970: TimeInterval(bsd.pbi_start_tvsec)) : Date.distantPast
 
             rows.append(ProcessRow(
                 pid: pid,
@@ -297,7 +311,9 @@ enum Sampler {
                 footprintBytes: usage.ri_phys_footprint,
                 ownedByMe: owned,
                 paused: paused,
-                parentPid: parent
+                parentPid: parent,
+                tty: tty,
+                startedAt: started
             ))
         }
         return rows.sorted { $0.footprintBytes > $1.footprintBytes }
@@ -333,7 +349,8 @@ enum Sampler {
             else if cwd == home { label = "~" }
             else { label = URL(fileURLWithPath: cwd).lastPathComponent }
             return SessionRow(pid: root.pid, label: label, cwd: cwd, shellPid: shell,
-                              treeBytes: bytes, treeCount: count, paused: root.paused)
+                              treeBytes: bytes, treeCount: count, paused: root.paused,
+                              tty: root.tty, startedAt: root.startedAt)
         }.sorted { $0.treeBytes > $1.treeBytes }
     }
 

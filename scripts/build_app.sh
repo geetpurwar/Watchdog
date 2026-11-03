@@ -53,7 +53,8 @@ echo "built $APP"
 if [[ "${1:-}" == "--install" ]]; then
     LABEL=com.geetpurwar.watchdog
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-    pkill -x Watchdog 2>/dev/null || true
+    # Only the installed copy; a raw test binary with the same name is left alone.
+    pgrep -f "^/Applications/Watchdog.app/Contents/MacOS/Watchdog$" | xargs -I{} kill {} 2>/dev/null || true
     rm -rf /Applications/Watchdog.app
     cp -R "$APP" /Applications/Watchdog.app
     /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/Watchdog.app
