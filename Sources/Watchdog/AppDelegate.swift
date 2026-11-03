@@ -152,13 +152,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         for s in pilot.adopt(sessions: sample.sessions) {
             log.event("adopted paused session '\(s.label)' pid \(s.pid) (paused with its shell by an earlier Watchdog); will resume it when memory is calm")
         }
-        // Belt and braces: any stopped shell of mine with nothing alive under it, seen twice, is continued.
-        let stranded = Set(Sampler.stoppedShellsWithoutChildren(in: sample.topProcessesAll))
-        for shell in stranded.intersection(strandedShellCandidates) {
-            let rc = kill(shell, SIGCONT)
-            log.event("rescued stopped shell \(shell) with no live children: \(rc == 0 ? "ok" : "failed errno=\(errno)")")
+        // Right after launch only: a stopped shell of mine with nothing alive under it was left behind by an
+        // earlier instance whose session died while paused. Later on, a stopped shell is somebody's choice.
+        if pilot.justStarted {
+            let stranded = Set(Sampler.stoppedShellsWithoutChildren(in: sample.topProcessesAll))
+            for shell in stranded.intersection(strandedShellCandidates) {
+                let rc = kill(shell, SIGCONT)
+                log.event("rescued stopped shell \(shell) with no live children: \(rc == 0 ? "ok" : "failed errno=\(errno)")")
+            }
+            strandedShellCandidates = stranded
         }
-        strandedShellCandidates = stranded
         if let decision = pilot.decide(sample: sample, verdict: v, shown: shown, now: now) {
             perform(decision, now: now)
         }

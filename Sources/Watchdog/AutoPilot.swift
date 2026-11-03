@@ -10,7 +10,9 @@ final class AutoPilot {
     }
 
     static let defaultsKey = "autoMode"
-    static let memoryRedKeys: Set<String> = ["pressure", "swapout", "swapgrowth", "swap", "used"]
+    /// What may trigger a pause. The static swap level is left out: paused sessions never give their swap
+    /// back, so a lingering 8 GB would keep them paused for good.
+    static let memoryRedKeys: Set<String> = ["pressure", "swapout", "swapgrowth", "used"]
     static let pausedKey = "autoPaused"
     static let shellsKey = "autoPausedShells"
     static let manualKey = "manualPaused"
@@ -95,6 +97,9 @@ final class AutoPilot {
 
     /// Forget sessions that ended or that were resumed by hand. Returns the shells of sessions that are gone
     /// altogether: they are still frozen and nobody else will ever free them.
+    /// True during the first readings after launch, when leftovers of an earlier instance may be found.
+    var justStarted: Bool { samplesSeen <= adoptionSamples }
+
     func reconcile(sessions: [SessionRow]) -> [Int32] {
         samplesSeen += 1
         var orphanedShells: [Int32] = []
@@ -117,7 +122,7 @@ final class AutoPilot {
     /// (a Ctrl-Z leaves the shell running; a menu pause is recorded as the user's). Take it over so it is
     /// resumed when memory is calm. Later in the run nothing is adopted: a pause that appears then is the user's.
     func adopt(sessions: [SessionRow]) -> [SessionRow] {
-        guard samplesSeen < adoptionSamples else { return [] }
+        guard enabled, samplesSeen < adoptionSamples else { return [] }
         let stranded = sessions.filter {
             $0.paused && $0.shellPaused && !pausedByUs.contains($0.pid) && manuallyPaused[$0.pid] == nil
         }

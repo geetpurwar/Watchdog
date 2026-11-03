@@ -259,7 +259,7 @@ enum Sampler {
     // MARK: - Processes
 
     /// Claude Code runs from ~/.local/share/claude/versions/<version>, so the kernel names it "2.1.312".
-    /// WATCHDOG_SESSION_PATH=<prefix> (tests) makes only executables under that prefix count.
+    /// WATCHDOG_SESSION_PATH=<prefix> (tests) makes executables under that prefix, and nothing else, count.
     static func isClaudeExecutable(_ path: String) -> Bool {
         if let prefix = env["WATCHDOG_SESSION_PATH"], !prefix.isEmpty {
             return path.hasPrefix(prefix)
@@ -350,7 +350,8 @@ enum Sampler {
         var childrenOf: [Int32: [ProcessRow]] = [:]
         for r in rows { childrenOf[r.parentPid, default: []].append(r) }
 
-        let claudePids = Set(rows.filter { $0.name == "claude" }.map(\.pid))
+        // Keyed on the executable, never on the name: a stray program called "claude" is not a session.
+        let claudePids = Set(rows.filter { $0.claudeBinary && $0.name == "claude" }.map(\.pid))
         func hasClaudeAncestor(_ row: ProcessRow) -> Bool {
             var p = row.parentPid
             var hops = 0
@@ -361,7 +362,7 @@ enum Sampler {
             }
             return false
         }
-        let roots = rows.filter { $0.name == "claude" && !hasClaudeAncestor($0) }
+        let roots = rows.filter { claudePids.contains($0.pid) && !hasClaudeAncestor($0) }
 
         return roots.map { root in
             var bytes = root.footprintBytes
